@@ -21,11 +21,14 @@ import { CheWorkspaceClient } from '../../../services/workspace-client/cheWorksp
 import { IDevWorkspace, IDevWorkspaceDevfile } from '@eclipse-che/devworkspace-client';
 import { deleteLogs, mergeLogs } from '../logs';
 import { getErrorMessage } from '../../../services/helpers/getErrorMessage';
+import { getDefer, IDeferred } from '../../../services/helpers/deferred';
+import { DisposableCollection } from '../../../services/helpers/disposable';
 
 const cheWorkspaceClient = container.get(CheWorkspaceClient);
 const devWorkspaceClient = container.get(DevWorkspaceClient);
 
 const devWorkspaceStatusMap = new Map<string, string | undefined>();
+const onStatusChangeCallbacks = new Map<string, (status: string) => Promise<void>>();
 
 export interface State {
   isLoading: boolean;
@@ -108,6 +111,7 @@ export type ActionCreators = {
   requestWorkspaces: () => AppThunk<KnownAction, Promise<void>>;
   requestWorkspace: (workspace: IDevWorkspace) => AppThunk<KnownAction, Promise<void>>;
   startWorkspace: (workspace: IDevWorkspace) => AppThunk<KnownAction, Promise<void>>;
+  restartWorkspace: (workspace: IDevWorkspace) => AppThunk<KnownAction, Promise<void>>;
   stopWorkspace: (workspace: IDevWorkspace) => AppThunk<KnownAction, Promise<void>>;
   terminateWorkspace: (workspace: IDevWorkspace) => AppThunk<KnownAction, Promise<void>>;
   updateWorkspace: (workspace: IDevWorkspace) => AppThunk<KnownAction, Promise<void>>;
@@ -215,6 +219,39 @@ export const actionCreators: ActionCreators = {
       });
       throw errorMessage;
     }
+  },
+
+  restartWorkspace: (workspace: IDevWorkspace): AppThunk<KnownAction, Promise<void>> => async (dispatch, getState): Promise<void> => {
+    const defer: IDeferred<void> = getDefer();
+    const toDispose = new DisposableCollection();
+    const onStatusChangeCallback = async status => {
+      if (status !== DevWorkspaceStatus.STOPPED && status !== DevWorkspaceStatus.FAILED) {
+        return;
+      }
+      try {
+        await dispatch(actionCreators.startWorkspace(workspace));
+        defer.resolve();
+      } catch (e) {
+        defer.reject(e);
+      }
+      toDispose.dispose();
+    };
+    if (workspace.status.phase === DevWorkspaceStatus.STOPPED || workspace.status.phase === DevWorkspaceStatus.FAILED) {
+      await onStatusChangeCallback(workspace.status.phase);
+    } else {
+      try {
+        await dispatch(actionCreators.stopWorkspace(workspace));
+      } catch (error) {
+        defer.reject(error);
+      }
+      const workspaceId = workspace.status.devworkspaceId;
+      onStatusChangeCallbacks.set(workspaceId, onStatusChangeCallback);
+      toDispose.push({
+        dispose: () => onStatusChangeCallbacks.delete(workspaceId)
+      });
+    }
+
+    return defer.promise;
   },
 
   stopWorkspace: (workspace: IDevWorkspace): AppThunk<KnownAction, Promise<void>> => async (dispatch): Promise<void> => {
@@ -408,7 +445,7 @@ export const reducer: Reducer<State> = (state: State | undefined, action: KnownA
 
 };
 
-function onStatusUpdateReceived(
+async function onStatusUpdateReceived(
   workspace: IDevWorkspace,
   dispatch: ThunkDispatch<State, undefined, KnownAction>,
   statusUpdate: IStatusUpdate) {
@@ -438,6 +475,10 @@ function onStatusUpdateReceived(
       }
     }
     status = statusUpdate.status;
+    const callback = onStatusChangeCallbacks.get(workspace.status.devworkspaceId);
+    if (callback && status) {
+      callback(status);
+    }
   }
   if (status && status !== devWorkspaceStatusMap.get(workspace.status.devworkspaceId)) {
     devWorkspaceStatusMap.set(workspace.status.devworkspaceId, status);
